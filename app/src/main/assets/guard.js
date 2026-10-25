@@ -4,12 +4,8 @@
   if (window.__cleanGuard) return;
   window.__cleanGuard = true;
 
-  // Scripted pop-ups / pop-unders do nothing.
-  try {
-    Object.defineProperty(window, 'open', { value: function () { return null; }, writable: false });
-  } catch (e) {
-    window.open = function () { return null; };
-  }
+  // Pop-ups are handled by the app itself: ones you didn't tap are blocked,
+  // ones you tapped (sign-in, payment windows) open in a closable window.
 
   // Hide common ad containers.
   var css = [
