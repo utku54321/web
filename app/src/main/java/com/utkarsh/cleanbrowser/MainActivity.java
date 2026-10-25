@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
+import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
@@ -61,6 +62,9 @@ public class MainActivity extends Activity {
     private FrameLayout fullscreen;
     private View customView;
     private WebChromeClient.CustomViewCallback customCallback;
+    private LinearLayout popupLayer;
+    private TextView popupTitle;
+    private WebView popup;
 
     private int blockedCount = 0;
     private String lastBlockedRedirect = null;
@@ -177,7 +181,27 @@ public class MainActivity extends Activity {
         fullscreen.setBackgroundColor(Color.BLACK);
         fullscreen.setVisibility(View.GONE);
 
+        // Pop-up windows you opened yourself (sign-in, payment pages) appear here on top.
+        popupLayer = new LinearLayout(this);
+        popupLayer.setOrientation(LinearLayout.VERTICAL);
+        popupLayer.setBackgroundColor(Color.parseColor("#2A2C33"));
+        popupLayer.setVisibility(View.GONE);
+        popupLayer.setClickable(true);
+        LinearLayout popupBar = new LinearLayout(this);
+        popupBar.setOrientation(LinearLayout.HORIZONTAL);
+        popupBar.setGravity(Gravity.CENTER_VERTICAL);
+        popupBar.setPadding(dp(12), dp(6), dp(4), dp(6));
+        popupTitle = new TextView(this);
+        popupTitle.setTextColor(Color.parseColor("#EEEEEE"));
+        popupTitle.setTextSize(14);
+        popupTitle.setSingleLine(true);
+        popupTitle.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        popupBar.addView(popupTitle);
+        popupBar.addView(barButton("✕", v -> closePopup()));
+        popupLayer.addView(popupBar);
+
         root.addView(content, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(popupLayer, new FrameLayout.LayoutParams(-1, -1));
         root.addView(fullscreen, new FrameLayout.LayoutParams(-1, -1));
         setContentView(root);
     }
@@ -260,9 +284,11 @@ public class MainActivity extends Activity {
 
                 if (url.equals(allowOnce)) { allowOnce = null; return false; }
 
-                // intent://, market://, app links etc. — used to throw you into the Play Store / apps
+                // tel:, mailto:, upi://, whatsapp://, intent:// etc.
+                // You tapped it -> ask before opening the app. A script did it -> block.
                 if (scheme == null || !(scheme.equals("http") || scheme.equals("https"))) {
-                    blocked();
+                    if (req.hasGesture()) openExternal(url);
+                    else blocked();
                     return true;
                 }
                 if (blocker.isAd(url)) {
@@ -300,29 +326,18 @@ public class MainActivity extends Activity {
                 progress.setVisibility(p >= 100 ? View.INVISIBLE : View.VISIBLE);
             }
 
-            // Pop-ups: new windows are never opened. A real tap on a target=_blank link
-            // opens in this same view instead — unless it leads to an ad.
+            // Pop-ups: windows a script opens on its own are blocked. A window you
+            // opened with a tap (Google/UPI/bank sign-in, payment pages) opens in a
+            // closable layer on top, so the page that opened it keeps working.
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
                 if (!isUserGesture) {
                     blocked();
                     return false;
                 }
-                WebView probe = new WebView(MainActivity.this);
-                probe.setWebViewClient(new WebViewClient() {
-                    @Override
-                    public boolean shouldOverrideUrlLoading(WebView pv, WebResourceRequest r) {
-                        String u = r.getUrl().toString();
-                        String sc = r.getUrl().getScheme();
-                        boolean http = "http".equals(sc) || "https".equals(sc);
-                        if (http && !blocker.isAd(u)) webView.loadUrl(u);
-                        else blocked();
-                        pv.post(pv::destroy);
-                        return true;
-                    }
-                });
+                WebView child = createPopup();
                 WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
-                transport.setWebView(probe);
+                transport.setWebView(child);
                 resultMsg.sendToTarget();
                 return true;
             }
@@ -399,14 +414,165 @@ public class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (customView != null) exitFullscreen();
+        else if (popup != null) {
+            if (popup.canGoBack()) popup.goBack();
+            else closePopup();
+        }
         else if (webView.canGoBack()) webView.goBack();
         else super.onBackPressed();
     }
 
     @Override
     protected void onDestroy() {
+        closePopup();
         if (webView != null) webView.destroy();
         super.onDestroy();
+    }
+
+    // ---------------------------------------------------------------- Pop-up window
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private WebView createPopup() {
+        closePopup();
+        WebView child = new WebView(this);
+        WebSettings cs = child.getSettings();
+        cs.setJavaScriptEnabled(true);
+        cs.setDomStorageEnabled(true);
+        cs.setUseWideViewPort(true);
+        cs.setLoadWithOverviewMode(true);
+        cs.setSupportMultipleWindows(false);
+        cs.setJavaScriptCanOpenWindowsAutomatically(false);
+        cs.setMediaPlaybackRequiresUserGesture(true);
+        cs.setGeolocationEnabled(false);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(child, false);
+
+        child.setWebViewClient(new WebViewClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                if (blocker.isAd(req.getUrl().toString())) {
+                    blocked();
+                    return new WebResourceResponse("text/plain", "utf-8",
+                            new ByteArrayInputStream(new byte[0]));
+                }
+                return null;
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
+                String url = req.getUrl().toString();
+                String scheme = req.getUrl().getScheme();
+                if (scheme == null || !(scheme.equals("http") || scheme.equals("https"))) {
+                    if (req.hasGesture()) openExternal(url);
+                    else blocked();
+                    return true;
+                }
+                if (blocker.isAd(url)) {
+                    blocked();
+                    closePopup();
+                    return true;
+                }
+                return false;
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                if (blocker.isAd(url)) {          // an ad that hijacked your tap
+                    blocked();
+                    closePopup();
+                    return;
+                }
+                Uri u = Uri.parse(url);
+                popupTitle.setText(u.getHost() != null ? u.getHost() : url);
+            }
+        });
+        child.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onCloseWindow(WebView window) {
+                closePopup();                     // the site closed its own pop-up
+            }
+
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                request.deny();
+            }
+        });
+
+        popup = child;
+        popupTitle.setText("Loading…");
+        popupLayer.addView(child, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        popupLayer.setVisibility(View.VISIBLE);
+        return child;
+    }
+
+    private void closePopup() {
+        if (popup == null) return;
+        WebView p = popup;
+        popup = null;
+        popupLayer.removeView(p);
+        popupLayer.setVisibility(View.GONE);
+        webView.post(p::destroy);
+    }
+
+    // ---------------------------------------------------------------- Other apps
+
+    /** Asks before handing a tapped tel:/mailto:/upi:/intent: link to another app. */
+    private void openExternal(String url) {
+        String scheme = Uri.parse(url).getScheme();
+        if (scheme == null) { blocked(); return; }
+        scheme = scheme.toLowerCase(Locale.ROOT);
+        if (scheme.equals("about") || scheme.equals("javascript") || scheme.equals("data")
+                || scheme.equals("blob") || scheme.equals("file") || scheme.equals("content")) {
+            blocked();
+            return;
+        }
+
+        final Intent intent;
+        try {
+            if (scheme.equals("intent")) {
+                intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
+                intent.setComponent(null);        // never let a page pick a private app screen
+                intent.setSelector(null);
+            } else {
+                intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            }
+            intent.addCategory(Intent.CATEGORY_BROWSABLE);
+        } catch (Exception e) {
+            blocked();
+            return;
+        }
+        final String fallback = intent.getStringExtra("browser_fallback_url");
+
+        String what;
+        switch (scheme) {
+            case "tel": what = "Call " + url.substring(4); break;
+            case "mailto": what = "Send an email to " + url.substring(7); break;
+            case "upi": what = "Pay with a UPI app"; break;
+            case "whatsapp": what = "Open WhatsApp"; break;
+            case "market": what = "Open the Play Store"; break;
+            default:
+                what = "Open " + (intent.getPackage() != null ? intent.getPackage() : scheme + ": link")
+                        + " in another app";
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Open another app?")
+                .setMessage(what + "\n\nOnly continue if you meant to.")
+                .setPositiveButton("Open", (d, w) -> {
+                    try {
+                        startActivity(intent);
+                    } catch (ActivityNotFoundException e) {
+                        if (fallback != null && (fallback.startsWith("https://") || fallback.startsWith("http://"))) {
+                            webView.loadUrl(fallback);
+                        } else {
+                            Toast.makeText(this, "No app on this phone can open that link",
+                                    Toast.LENGTH_SHORT).show();
+                        }
+                    } catch (Exception e) {
+                        Toast.makeText(this, "Can't open that link", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private String readAsset(String name) {
